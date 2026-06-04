@@ -1,0 +1,244 @@
+name: Security Scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read
+  pull-requests: write
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ── SEMGREP ────────────────────────────────────────────────────────────────
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config=auto \
+            --config=config/semgrep-rules.yml \
+            --json \
+            --output=results/semgrep.json \
+            --error || true
+
+      - name: Upload Semgrep results
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: results/semgrep.json
+          retention-days: 30
+
+  # ── BANDIT ─────────────────────────────────────────────────────────────────
+  bandit:
+    name: Bandit Python SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit
+        run: |
+          mkdir -p results
+          bandit \
+            -r . \
+            -c config/bandit.yml \
+            -f json \
+            -o results/bandit.json \
+            --exit-zero
+
+      - name: Upload Bandit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-results
+          path: results/bandit.json
+          retention-days: 30
+
+  # ── BETTERLEAKS ────────────────────────────────────────────────────────────
+  betterleaks:
+    name: Betterleaks Secret Detection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for secret scanning
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Betterleaks
+        run: pip install betterleaks==1.0.1
+
+      - name: Run Betterleaks
+        run: |
+          mkdir -p results
+          betterleaks scan \
+            --output results/betterleaks.json \
+            --format json \
+            . || true
+
+      - name: Upload Betterleaks results
+        uses: actions/upload-artifact@v4
+        with:
+          name: betterleaks-results
+          path: results/betterleaks.json
+          retention-days: 30
+
+  # ── PIP-AUDIT ──────────────────────────────────────────────────────────────
+  pip-audit:
+    name: pip-audit SCA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        run: |
+          mkdir -p results
+          pip-audit \
+            --format json \
+            --output results/pip-audit.json \
+            --require-hashes \
+            -r requirements.txt || true
+
+      - name: Upload pip-audit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-results
+          path: results/pip-audit.json
+          retention-days: 30
+
+  # ── CHECKOV ────────────────────────────────────────────────────────────────
+  checkov:
+    name: Checkov IaC Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Checkov
+        run: pip install checkov
+
+      - name: Run Checkov
+        run: |
+          mkdir -p results
+          checkov \
+            -d . \
+            --config-file config/checkov-skip.yml \
+            --output json \
+            --output-file results/checkov.json \
+            --soft-fail
+
+      - name: Upload Checkov results
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-results
+          path: results/checkov.json
+          retention-days: 30
+
+  # ── AGGREGATE & STORE ──────────────────────────────────────────────────────
+  aggregate-and-store:
+    name: Aggregate Results & Store
+    runs-on: ubuntu-latest
+    needs: [semgrep, bandit, betterleaks, pip-audit, checkov]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: results/
+
+      - name: Install dependencies
+        run: pip install azure-storage-blob
+
+      - name: OIDC login to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Aggregate results
+        run: |
+          python scripts/parse_results.py \
+            --results-dir results/ \
+            --repo ${{ github.repository }} \
+            --run-id ${{ github.run_id }} \
+            --branch ${{ github.ref_name }} \
+            --output aggregated-results.json
+
+      - name: Upload to Azure Blob Storage
+        run: |
+          az storage blob upload \
+            --account-name ${{ vars.STORAGE_ACCOUNT_NAME }} \
+            --container-name ${{ vars.STORAGE_CONTAINER_NAME }} \
+            --name "${{ github.repository }}/${{ github.run_id }}/aggregated-results.json" \
+            --file aggregated-results.json \
+            --auth-mode login
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('aggregated-results.json'));
+            const summary = `## Security Scan Results
+            | Scanner | Findings |
+            |---|---|
+            | Semgrep | ${results.semgrep?.total ?? 'N/A'} |
+            | Bandit | ${results.bandit?.total ?? 'N/A'} |
+            | Betterleaks | ${results.betterleaks?.total ?? 'N/A'} |
+            | pip-audit | ${results.pip_audit?.total ?? 'N/A'} |
+            | Checkov | ${results.checkov?.total ?? 'N/A'} |
+            
+            Run ID: ${{ github.run_id }}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
